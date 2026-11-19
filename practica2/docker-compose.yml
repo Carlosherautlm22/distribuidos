@@ -1,0 +1,123 @@
+name: practica2
+x-db: &db
+  image: postgres:16-alpine
+  environment:
+    POSTGRES_USER: labuser
+    POSTGRES_PASSWORD: labpass
+    POSTGRES_DB: labdb
+    POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+  networks: [datos]
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U labuser -d labdb"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+x-app: &app
+  build: .
+  networks: [datos]
+  volumes: ["estado:/state"]
+  environment:
+    MODE: api
+    STATE_DB: /state/state.sqlite
+    AMQP_URL: amqp://labuser:labpass@rabbitmq:5672/%2F?heartbeat=60
+  restart: unless-stopped
+
+
+services:
+  pg_master:
+    <<: *db
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10", "-c", "max_slot_wal_keep_size=1GB"]
+    ports: ["127.0.0.1:5433:5432"]
+    volumes:
+      - master_data:/var/lib/postgresql/data
+      - ./postgres/common.sql:/docker-entrypoint-initdb.d/01-common.sql:ro
+      - ./postgres/master.sql:/docker-entrypoint-initdb.d/02-master.sql:ro
+  pg_nodo_norte:
+    <<: *db
+    ports: ["127.0.0.1:5434:5432"]
+    volumes:
+      - norte_data:/var/lib/postgresql/data
+      - ./postgres/common.sql:/docker-entrypoint-initdb.d/01-common.sql:ro
+  pg_nodo_sur:
+    <<: *db
+    ports: ["127.0.0.1:5435:5432"]
+    volumes:
+      - sur_data:/var/lib/postgresql/data
+      - ./postgres/common.sql:/docker-entrypoint-initdb.d/01-common.sql:ro
+  bootstrap:
+    <<: *app
+    environment: {MODE: bootstrap}
+    restart: "no"
+    depends_on:
+      pg_master: {condition: service_healthy}
+      pg_nodo_norte: {condition: service_healthy}
+      pg_nodo_sur: {condition: service_healthy}
+  api:
+    <<: *app
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  monitor:
+    <<: *app
+    environment: {MODE: monitor, STATE_DB: /state/state.sqlite}
+    depends_on:
+      api: {condition: service_healthy}
+  eventos:
+    <<: *app
+    environment: {MODE: consumer, STATE_DB: /state/state.sqlite}
+    depends_on:
+      api: {condition: service_healthy}
+  gateway:
+    image: nginx:alpine
+    ports: ["127.0.0.1:8080:80"]
+    volumes: ["./nginx.conf:/etc/nginx/nginx.conf:ro"]
+    networks: [datos]
+    restart: unless-stopped
+    depends_on:
+      api: {condition: service_healthy}
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: labuser
+      RABBITMQ_DEFAULT_PASS: labpass
+    ports: ["127.0.0.1:15672:15672"]
+    networks: [datos]
+    volumes: ["rabbit_data:/var/lib/rabbitmq"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  pgadmin:
+    image: dpage/pgadmin4:9
+    environment:
+      PGADMIN_DEFAULT_EMAIL: docente@practica.com
+      PGADMIN_DEFAULT_PASSWORD: adminpass
+      PGADMIN_CONFIG_SERVER_MODE: "True"
+    ports: ["127.0.0.1:5050:80"]
+    networks: [datos]
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+    restart: unless-stopped
+
+networks:
+  datos:
+    name: practica2_datos
+    driver: bridge
+
+
+volumes:
+  master_data:
+  norte_data:
+  sur_data:
+  rabbit_data:
+  pgadmin_data:
+  estado:
